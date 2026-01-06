@@ -1,0 +1,14 @@
+# Roo configuration
+.roo/
+
+# Result files
+result/
+
+
+
+# IDE
+.vscode/
+*.swp
+
+# Logs
+*.log
