@@ -24,4 +24,10 @@
 
 7. 移除viztracer相关内容，现在我们不需要分析性能了
    完成
-9. 在tmp目录下编写一个time baseline.py，输出7M参数的卷积神经网络ResNet和7M参数的vision transformer vit的推理时间
+8. 在tmp目录下编写一个time baseline.py，输出7M参数的卷积神经网络ResNet和7M参数的vision transformer vit的推理时间
+   完成
+9.  当前只测试了一个vim tiny，在models mamba.py文件里面，增加几个@register_model，使其参数量分别为5M，10M，15M，20M左右。主要通过调整模型的深度，宽度来调整总参数量。然后在inf cpu.py当中，增加这些模型的测试。并且，测试时，预热3轮，测试跑10轮即可。
+    完成
+10. 我们已经安装了thop库，先写个简单testflops.py看看vim tiny的FLOPs是多少
+    完成
+11. 现在继续增加模型，按照FLOPs在2G，3G，4G，5G设置模型，仍然通过调整模型深度，宽度来调整FLOPs，然后在inf cpu.py当中，增加这些模型的测试，同样的每一个模型也都要测试16种优化配置方案

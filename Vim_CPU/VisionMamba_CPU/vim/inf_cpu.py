@@ -1,12 +1,13 @@
 #Presented by KeJi
-#Date: 2026-01-06
+#Date: 2026-01-07
 
 """
 Vision Mamba CPU推理性能测试脚本
 
 功能：
-1. 创建Vim-tiny模型（随机初始化或加载预训练）
-2. 执行推理基准测试
+1. 测试9种模型：5种按参数量（5M/7M/10M/15M/20M） + 4种按FLOPs（2G/3G/4G/5G）
+2. 每种模型测试16种优化配置（Python/C++/FullCPP/SIMD各4种）
+3. 预热3轮，测试10轮
 
 使用方式：
     python inf_cpu.py
@@ -20,22 +21,16 @@ import logging
 import platform
 from datetime import datetime
 
-# 强制使用纯PyTorch实现（CPU环境）
 os.environ['SELECTIVE_SCAN_FORCE_FALLBACK'] = 'TRUE'
 os.environ['CAUSAL_CONV1D_FORCE_FALLBACK'] = 'TRUE'
 
-# 添加必要目录到Python路径
 current_dir = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, current_dir)  # vim目录
+sys.path.insert(0, current_dir)
 
-# 添加mamba-1p1p1目录以导入mamba_ssm模块
 mamba_dir = os.path.join(os.path.dirname(current_dir), 'mamba-1p1p1')
 if os.path.exists(mamba_dir):
     sys.path.insert(0, mamba_dir)
-else:
-    print(f"警告: 未找到mamba-1p1p1目录: {mamba_dir}")
 
-# 添加modules目录以导入vision_mamba_cpp（全C++实现）
 modules_dir = os.path.join(mamba_dir, 'mamba_ssm', 'modules')
 if os.path.exists(modules_dir):
     sys.path.insert(0, modules_dir)
@@ -44,55 +39,54 @@ from timm.models import create_model
 import models_mamba
 
 
-def create_vim_tiny_model(pretrained=False, checkpoint_path=None,
-                         use_cpp_scan=False, use_fixlen_scan=False,
-                         use_fused_bidirectional=False, use_full_cpp=False,
-                         use_simd_scan=False, use_simd_fixlen_scan=False,
-                         use_simd_fused_scan=False, use_simd_fused_fixlen_scan=False):
-    """
-    创建Vim-tiny模型
+MODEL_CONFIGS = {
+    # 按参数量分类
+    'vim_5m': 'vim_5m_patch16_224_bimambav2',
+    'vim_tiny': 'vim_tiny_patch16_224_bimambav2_final_pool_mean_abs_pos_embed_with_midclstok_div2',
+    'vim_10m': 'vim_10m_patch16_224_bimambav2',
+    'vim_15m': 'vim_15m_patch16_224_bimambav2',
+    'vim_20m': 'vim_20m_patch16_224_bimambav2',
+    # 按FLOPs分类
+    'vim_2gflops': 'vim_2gflops_patch16_224_bimambav2',
+    'vim_3gflops': 'vim_3gflops_patch16_224_bimambav2',
+    'vim_4gflops': 'vim_4gflops_patch16_224_bimambav2',
+    'vim_5gflops': 'vim_5gflops_patch16_224_bimambav2',
+}
+
+# 16种优化配置
+OPTIMIZATION_CONFIGS = [
+    # Python实现（4种）
+    {'name': 'Python-Original', 'use_cpp_scan': False, 'use_fixlen_scan': False, 'use_fused_bidirectional': False},
+    {'name': 'Python-Fixlen', 'use_cpp_scan': False, 'use_fixlen_scan': True, 'use_fused_bidirectional': False},
+    {'name': 'Python-Fused', 'use_cpp_scan': False, 'use_fixlen_scan': False, 'use_fused_bidirectional': True},
+    {'name': 'Python-Fused-Fixlen', 'use_cpp_scan': False, 'use_fixlen_scan': True, 'use_fused_bidirectional': True},
+    # C++实现（4种）
+    {'name': 'CPP-Original', 'use_cpp_scan': True, 'use_fixlen_scan': False, 'use_fused_bidirectional': False},
+    {'name': 'CPP-Fixlen', 'use_cpp_scan': True, 'use_fixlen_scan': True, 'use_fused_bidirectional': False},
+    {'name': 'CPP-Fused', 'use_cpp_scan': True, 'use_fixlen_scan': False, 'use_fused_bidirectional': True},
+    {'name': 'CPP-Fused-Fixlen', 'use_cpp_scan': True, 'use_fixlen_scan': True, 'use_fused_bidirectional': True},
+    # 全C++实现（4种）
+    {'name': 'FullCPP-Original', 'use_cpp_scan': True, 'use_fixlen_scan': False, 'use_fused_bidirectional': False, 'use_full_cpp': True},
+    {'name': 'FullCPP-Fixlen', 'use_cpp_scan': True, 'use_fixlen_scan': True, 'use_fused_bidirectional': False, 'use_full_cpp': True},
+    {'name': 'FullCPP-Fused', 'use_cpp_scan': True, 'use_fixlen_scan': False, 'use_fused_bidirectional': True, 'use_full_cpp': True},
+    {'name': 'FullCPP-Fused-Fixlen', 'use_cpp_scan': True, 'use_fixlen_scan': True, 'use_fused_bidirectional': True, 'use_full_cpp': True},
+    # SIMD实现（4种）
+    {'name': 'SIMD', 'use_simd_scan': True},
+    {'name': 'SIMD-Fixlen', 'use_simd_fixlen_scan': True},
+    {'name': 'SIMD-Fused', 'use_fused_bidirectional': True, 'use_simd_fused_scan': True},
+    {'name': 'SIMD-Fused-Fixlen', 'use_fused_bidirectional': True, 'use_simd_fused_fixlen_scan': True},
+]
+
+
+def Create_Vim_Model(model_name='vim_tiny', use_cpp_scan=False, use_fixlen_scan=False,
+                     use_fused_bidirectional=False, use_full_cpp=False,
+                     use_simd_scan=False, use_simd_fixlen_scan=False,
+                     use_simd_fused_scan=False, use_simd_fused_fixlen_scan=False):
+    """创建Vim模型"""
+    timm_name = MODEL_CONFIGS.get(model_name, MODEL_CONFIGS['vim_tiny'])
     
-    参数:
-        pretrained: 是否使用预训练权重（如果可用）
-        checkpoint_path: 预训练模型检查点路径
-        use_cpp_scan: 使用C++优化实现（来自Mamba_CPU）
-        use_fixlen_scan: 使用两阶段优化算法（仅当use_cpp_scan=True时有效）
-        use_fused_bidirectional: 使用融合双向扫描（合并正向和反向计算）
-        use_simd_scan: 使用SIMD优化的selective scan（N维度向量化）
-        use_simd_fixlen_scan: 使用SIMD+两阶段优化
-        use_simd_fused_scan: 使用SIMD+融合双向优化
-        use_simd_fused_fixlen_scan: 使用SIMD+融合+两阶段优化（最高性能）
-    
-    配置：
-   - img_size: 224
-   - patch_size: 16
-    - embed_dim: 192
-    - depth: 24
-    - d_state: 16
-    - num_classes: 1000
-    """
-    scan_type = "Python-Ref"
-    if use_simd_fused_fixlen_scan:
-        scan_type = "SIMD-Fused-Fixlen"
-    elif use_simd_fused_scan:
-        scan_type = "SIMD-Fused"
-    elif use_simd_fixlen_scan:
-        scan_type = "SIMD-Fixlen"
-    elif use_simd_scan:
-        scan_type = "SIMD"
-    elif use_full_cpp:
-        scan_type = "FullCPP-Fused-Fixlen" if use_fused_bidirectional and use_fixlen_scan else \
-                   "FullCPP-Fused" if use_fused_bidirectional else \
-                   "FullCPP-Fixlen" if use_fixlen_scan else "FullCPP-Original"
-    elif use_fused_bidirectional:
-        scan_type = "Python-Fused-BiDir"
-    elif use_cpp_scan:
-        scan_type = "C++-Fixlen" if use_fixlen_scan else "C++-Original"
-    print(f"创建Vim-tiny模型 (Scan类型: {scan_type})...")
-    
-    # 使用timm的create_model接口（参考infer_rpi.py）
     model = create_model(
-        'vim_tiny_patch16_224_bimambav2_final_pool_mean_abs_pos_embed_with_midclstok_div2',
+        timm_name,
         pretrained=False,
         num_classes=1000,
         drop_rate=0.0,
@@ -108,402 +102,199 @@ def create_vim_tiny_model(pretrained=False, checkpoint_path=None,
         use_simd_fused_fixlen_scan=use_simd_fused_fixlen_scan,
     )
     
-    # 如果提供了检查点路径，加载权重
-    if checkpoint_path and os.path.exists(checkpoint_path):
-        print(f"加载检查点: {checkpoint_path}")
-        checkpoint = torch.load(checkpoint_path, map_location='cpu')
-        if 'model' in checkpoint:
-            model.load_state_dict(checkpoint['model'])
-        else:
-            model.load_state_dict(checkpoint)
-    
     model.eval()
-    
-    # 统计参数量
     total_params = sum(p.numel() for p in model.parameters())
-    print(f"模型参数量: {total_params:,} ({total_params/1e6:.2f}M)")
     
-    return model
+    return model, total_params
 
 
-def warmup_inference(model, input_tensor, num_warmup=3):
+def Warmup_Inference(model, input_tensor, num_warmup=3):
     """模型预热"""
-    print(f"\n预热推理 ({num_warmup}次)...")
     with torch.no_grad():
         for i in range(num_warmup):
             _ = model(input_tensor)
-            print(f"  预热 {i+1}/{num_warmup} 完成")
 
 
-def benchmark_inference(model, input_tensor, num_runs=10):
+def Benchmark_Inference(model, input_tensor, num_runs=10):
     """性能基准测试"""
-    print(f"\n基准性能测试 ({num_runs}次)...")
     times = []
-    
     with torch.no_grad():
         for i in range(num_runs):
             start = time.perf_counter()
             output = model(input_tensor)
             end = time.perf_counter()
-            
-            elapsed = (end - start) * 1000  # 转换为毫秒
-            times.append(elapsed)
-            print(f"  Run {i+1}/{num_runs}: {elapsed:.2f} ms")
+            times.append((end - start) * 1000)
     
-    avg_time = sum(times) / len(times)
-    min_time = min(times)
-    max_time = max(times)
-    
-    print(f"\n性能统计:")
-    print(f"  平均时间: {avg_time:.2f} ms")
-    print(f"  最小时间: {min_time:.2f} ms")
-    print(f"  最大时间: {max_time:.2f} ms")
-    print(f"  输出形状: {output.shape}")
-    
-    return avg_time, output
+    return sum(times) / len(times), min(times), max(times), output
 
 
-def setup_logging():
+def Setup_Logging():
     """设置日志记录"""
-    log_file = 'result.log'
-    
-    # 创建logger
+    log_file = 'test.log'
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
-    
-    # 清除已有的handlers
     logger.handlers.clear()
     
-    # 文件handler
     file_handler = logging.FileHandler(log_file, mode='w', encoding='utf-8')
-    file_handler.setLevel(logging.INFO)
-    file_formatter = logging.Formatter('%(message)s')
-    file_handler.setFormatter(file_formatter)
+    file_handler.setFormatter(logging.Formatter('%(message)s'))
     
-    # 控制台handler
     console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(logging.INFO)
-    console_formatter = logging.Formatter('%(message)s')
-    console_handler.setFormatter(console_formatter)
+    console_handler.setFormatter(logging.Formatter('%(message)s'))
     
-    # 添加handlers
     logger.addHandler(file_handler)
     logger.addHandler(console_handler)
     
     return logger
 
-def log_print(msg, logger=None):
-    """同时打印到控制台和日志文件"""
+
+def Log_Print(msg, logger=None):
     if logger:
         logger.info(msg)
     else:
         print(msg)
 
+
 def main():
     """主函数"""
-    # 设置日志
-    logger = setup_logging()
-    
-    # 记录开始时间
+    logger = Setup_Logging()
     start_time = datetime.now()
     
-    log_print("=" * 80, logger)
-    log_print("Vision Mamba CPU推理性能测试 - 对比三种Selective Scan实现", logger)
-    log_print("=" * 80, logger)
-    log_print(f"\n测试时间: {start_time.strftime('%Y-%m-%d %H:%M:%S')}", logger)
-    log_print(f"平台: {platform.machine()}", logger)
+    Log_Print("=" * 100, logger)
+    Log_Print("Vision Mamba CPU推理性能测试 - 9种模型(5种参数量+4种FLOPs) x 16种优化配置", logger)
+    Log_Print("=" * 100, logger)
+    Log_Print(f"测试时间: {start_time.strftime('%Y-%m-%d %H:%M:%S')}", logger)
+    Log_Print(f"平台: {platform.machine()}", logger)
+    Log_Print(f"PyTorch: {torch.__version__}, Python: {sys.version.split()[0]}, CPU线程: {torch.get_num_threads()}", logger)
     
-    # 检查环境
-    log_print("\n环境配置:", logger)
-    log_print(f"  PyTorch版本: {torch.__version__}", logger)
-    log_print(f"  Python版本: {sys.version.split()[0]}", logger)
-    log_print(f"  CPU线程数: {torch.get_num_threads()}", logger)
-    log_print(f"  SELECTIVE_SCAN_FORCE_FALLBACK: {os.environ.get('SELECTIVE_SCAN_FORCE_FALLBACK', 'FALSE')}", logger)
-    
-    # 检查C++扩展是否可用
+    # 检查C++扩展
     try:
         import selective_scan_cpp
-        log_print(f"  C++扩展: ✓ 可用", logger)
         cpp_available = True
+        Log_Print("C++扩展: ✓", logger)
     except ImportError:
-        log_print(f"  C++扩展: ✗ 不可用（将使用Python fallback）", logger)
         cpp_available = False
+        Log_Print("C++扩展: ✗", logger)
     
-    # 创建随机输入（batch_size=1, channels=3, height=128, width=128）
-    log_print("\n创建输入张量...", logger)
-    input_tensor = torch.randn(1, 3, 224, 224)
-    log_print(f"输入形状: {input_tensor.shape}", logger)
-    
-    # 定义测试配置：Python和C++版本的原始、两阶段、融合实验
-    test_configs = [
-        # === Python实现（4种）===
-        {
-            'name': 'Python-Original',
-            'use_cpp_scan': False,
-            'use_fixlen_scan': False,
-            'use_fused_bidirectional': False,
-            'desc': 'Python原始实现（分离双向扫描）'
-        },
-        {
-            'name': 'Python-Fixlen',
-            'use_cpp_scan': False,
-            'use_fixlen_scan': True,
-            'use_fused_bidirectional': False,
-            'desc': 'Python两阶段实现（分离双向+fixlen优化）'
-        },
-        {
-            'name': 'Python-Fused',
-            'use_cpp_scan': False,
-            'use_fixlen_scan': False,
-            'use_fused_bidirectional': True,
-            'desc': 'Python融合实现（N维度concat批量计算）'
-        },
-        {
-            'name': 'Python-Fused-Fixlen',
-            'use_cpp_scan': False,
-            'use_fixlen_scan': True,
-            'use_fused_bidirectional': True,
-            'desc': 'Python融合+两阶段实现（双重优化）'
-        },
-        
-        # === C++实现（4种）===
-        {
-            'name': 'CPP-Original',
-            'use_cpp_scan': True,
-            'use_fixlen_scan': False,
-            'use_fused_bidirectional': False,
-            'desc': 'C++原始实现（分离双向扫描）'
-        },
-        {
-            'name': 'CPP-Fixlen',
-            'use_cpp_scan': True,
-            'use_fixlen_scan': True,
-            'use_fused_bidirectional': False,
-            'desc': 'C++两阶段实现（分离双向+fixlen优化）'
-        },
-        {
-            'name': 'CPP-Fused',
-            'use_cpp_scan': True,
-            'use_fixlen_scan': False,
-            'use_fused_bidirectional': True,
-            'desc': 'C++融合实现（N维度concat批量计算）'
-        },
-        {
-            'name': 'CPP-Fused-Fixlen',
-            'use_cpp_scan': True,
-            'use_fixlen_scan': True,
-            'use_fused_bidirectional': True,
-            'desc': 'C++融合+两阶段实现（双重优化）'
-        },
-        
-        # === 全C++实现（4种）===
-        {
-            'name': 'FullCPP-Original',
-            'use_cpp_scan': True,
-            'use_fixlen_scan': False,
-            'use_fused_bidirectional': False,
-            'use_full_cpp': True,
-            'desc': '全C++ Mamba实现（原始扫描）'
-        },
-        {
-            'name': 'FullCPP-Fixlen',
-            'use_cpp_scan': True,
-            'use_fixlen_scan': True,
-            'use_fused_bidirectional': False,
-            'use_full_cpp': True,
-            'desc': '全C++ Mamba实现（两阶段优化）'
-        },
-        {
-            'name': 'FullCPP-Fused',
-            'use_cpp_scan': True,
-            'use_fixlen_scan': False,
-            'use_fused_bidirectional': True,
-            'use_full_cpp': True,
-            'desc': '全C++ Mamba实现（融合双向）'
-        },
-        {
-            'name': 'FullCPP-Fused-Fixlen',
-            'use_cpp_scan': True,
-            'use_fixlen_scan': True,
-            'use_fused_bidirectional': True,
-            'use_full_cpp': True,
-            'desc': '全C++ Mamba实现（融合+两阶段）'
-        },
-        
-        # === SIMD实现（4种）===
-        {
-            'name': 'SIMD',
-            'use_cpp_scan': False,
-            'use_fixlen_scan': False,
-            'use_fused_bidirectional': False,
-            'use_full_cpp': False,
-            'use_simd_scan': True,
-            'desc': 'SIMD优化实现（N维度AVX/AVX2向量化）'
-        },
-        {
-            'name': 'SIMD-Fixlen',
-            'use_cpp_scan': False,
-            'use_fixlen_scan': False,
-            'use_fused_bidirectional': False,
-            'use_full_cpp': False,
-            'use_simd_fixlen_scan': True,
-            'desc': 'SIMD+两阶段优化（向量化递推+批量输出）'
-        },
-        {
-            'name': 'SIMD-Fused',
-            'use_cpp_scan': False,
-            'use_fixlen_scan': False,
-            'use_fused_bidirectional': True,
-            'use_full_cpp': False,
-            'use_simd_fused_scan': True,
-            'desc': 'SIMD+融合双向优化（2N状态向量化）'
-        },
-        {
-            'name': 'SIMD-Fused-Fixlen',
-            'use_cpp_scan': False,
-            'use_fixlen_scan': False,
-            'use_fused_bidirectional': True,
-            'use_full_cpp': False,
-            'use_simd_fused_fixlen_scan': True,
-            'desc': 'SIMD+融合+两阶段优化（最高性能）'
-        },
-    ]
-    
-    models = {}
-    outputs = {}
-    timings = {}
-    
-    # ===== 关键修改：先创建基础模型并保存参数 =====
-    log_print("\n" + "=" * 80, logger)
-    log_print("步骤1: 创建基础模型并保存参数（确保所有测试使用相同参数）", logger)
-    log_print("=" * 80, logger)
-    
-    base_model = create_vim_tiny_model(
-        use_cpp_scan=False,  # 创建Python版本作为基础
-        use_fixlen_scan=False
-    )
-    # 保存参数
-    base_state_dict = base_model.state_dict()
-    log_print(f"✓ 基础模型参数已保存（参数量: {sum(p.numel() for p in base_model.parameters())/1e6:.2f}M）", logger)
-    
-    # 删除基础模型释放内存
-    del base_model
-    
-    log_print("\n" + "=" * 80, logger)
-    log_print("步骤2: 测试各种配置（使用相同的模型参数）", logger)
-    log_print("=" * 80, logger)
-    
-    # 检查全C++扩展是否可用
     try:
         import vision_mamba_cpp
-        log_print(f"  全C++扩展: ✓ 可用", logger)
         full_cpp_available = True
+        Log_Print("全C++扩展: ✓", logger)
     except ImportError:
-        log_print(f"  全C++扩展: ✗ 不可用", logger)
         full_cpp_available = False
+        Log_Print("全C++扩展: ✗", logger)
     
-    # 测试每种配置
-    for config in test_configs:
-        name = config['name']
-        log_print("\n" + "=" * 80, logger)
-        log_print(f"测试配置: {name} - {config['desc']}", logger)
-        log_print("=" * 80, logger)
-        
-        # 如果C++不可用但请求使用C++，跳过
-        if config['use_cpp_scan'] and not cpp_available:
-            log_print(f"⚠ 跳过 {name}（C++扩展不可用）", logger)
-            continue
-        
-        # 如果全C++不可用但请求使用全C++，跳过
-        use_full_cpp = config.get('use_full_cpp', False)
-        if use_full_cpp and not full_cpp_available:
-            log_print(f"⚠ 跳过 {name}（全C++扩展不可用）", logger)
-            continue
-        
-        # 创建模型
-        use_simd_scan = config.get('use_simd_scan', False)
-        use_simd_fixlen_scan = config.get('use_simd_fixlen_scan', False)
-        use_simd_fused_scan = config.get('use_simd_fused_scan', False)
-        use_simd_fused_fixlen_scan = config.get('use_simd_fused_fixlen_scan', False)
-        model = create_vim_tiny_model(
-            use_cpp_scan=config['use_cpp_scan'],
-            use_fixlen_scan=config['use_fixlen_scan'],
-            use_fused_bidirectional=config['use_fused_bidirectional'],
-            use_full_cpp=use_full_cpp,
-            use_simd_scan=use_simd_scan,
-            use_simd_fixlen_scan=use_simd_fixlen_scan,
-            use_simd_fused_scan=use_simd_fused_scan,
-            use_simd_fused_fixlen_scan=use_simd_fused_fixlen_scan
-        )
-        
-        # ===== 关键：加载相同的参数 =====
-        model.load_state_dict(base_state_dict)
-        log_print(f"✓ 已加载基础模型参数", logger)
-        
-        models[name] = model
-        
-        # 预热
-        warmup_inference(model, input_tensor, num_warmup=10)
-        
-        # 基准测试
-        avg_time, output = benchmark_inference(model, input_tensor, num_runs=100)
-        outputs[name] = output
-        timings[name] = avg_time
+    input_tensor = torch.randn(1, 3, 224, 224)
+    NUM_WARMUP = 3
+    NUM_RUNS = 10
+    Log_Print(f"\n输入: {input_tensor.shape}, 预热: {NUM_WARMUP}次, 测试: {NUM_RUNS}次", logger)
     
-    # 对比输出一致性
-    if len(outputs) > 1:
-        log_print("\n" + "=" * 80, logger)
-        log_print("输出一致性验证", logger)
-        log_print("=" * 80, logger)
+    # 按参数量分类(5种) + 按FLOPs分类(4种) = 9种模型
+    models_to_test = [
+        # 按参数量
+        'vim_5m', 'vim_tiny', 'vim_10m', 'vim_15m', 'vim_20m',
+        # 按FLOPs
+        'vim_2gflops', 'vim_3gflops', 'vim_4gflops', 'vim_5gflops',
+    ]
+    all_results = {}
+    
+    for model_name in models_to_test:
+        Log_Print("\n" + "=" * 100, logger)
+        Log_Print(f"模型: {model_name}", logger)
+        Log_Print("=" * 100, logger)
         
-        ref_name = list(outputs.keys())[0]
-        ref_output = outputs[ref_name]
+        # 创建基础模型保存参数
+        base_model, total_params = Create_Vim_Model(model_name)
+        base_state_dict = base_model.state_dict()
+        Log_Print(f"参数量: {total_params:,} ({total_params/1e6:.2f}M)", logger)
+        del base_model
         
-        for name, output in outputs.items():
-            if name == ref_name:
+        model_results = {}
+        
+        for config in OPTIMIZATION_CONFIGS:
+            cfg_name = config['name']
+            
+            # 检查依赖
+            use_cpp = config.get('use_cpp_scan', False)
+            use_full_cpp = config.get('use_full_cpp', False)
+            use_simd = config.get('use_simd_scan', False) or config.get('use_simd_fixlen_scan', False) or \
+                       config.get('use_simd_fused_scan', False) or config.get('use_simd_fused_fixlen_scan', False)
+            
+            if use_cpp and not cpp_available:
+                Log_Print(f"  {cfg_name:<22} 跳过(C++不可用)", logger)
                 continue
-            diff = torch.abs(output - ref_output).max().item()
-            status = " ✓ 一致" if diff < 1e-4 else " ✗ 不一致!"
-            log_print(f"{name} vs {ref_name}: 最大差异 = {diff:.2e}{status}", logger)
+            if use_full_cpp and not full_cpp_available:
+                Log_Print(f"  {cfg_name:<22} 跳过(全C++不可用)", logger)
+                continue
+            if use_simd and not cpp_available:
+                Log_Print(f"  {cfg_name:<22} 跳过(SIMD需要C++)", logger)
+                continue
+            
+            try:
+                model, _ = Create_Vim_Model(
+                    model_name,
+                    use_cpp_scan=config.get('use_cpp_scan', False),
+                    use_fixlen_scan=config.get('use_fixlen_scan', False),
+                    use_fused_bidirectional=config.get('use_fused_bidirectional', False),
+                    use_full_cpp=config.get('use_full_cpp', False),
+                    use_simd_scan=config.get('use_simd_scan', False),
+                    use_simd_fixlen_scan=config.get('use_simd_fixlen_scan', False),
+                    use_simd_fused_scan=config.get('use_simd_fused_scan', False),
+                    use_simd_fused_fixlen_scan=config.get('use_simd_fused_fixlen_scan', False),
+                )
+                
+                model.load_state_dict(base_state_dict)
+                Warmup_Inference(model, input_tensor, NUM_WARMUP)
+                avg_time, min_time, max_time, output = Benchmark_Inference(model, input_tensor, NUM_RUNS)
+                
+                model_results[cfg_name] = {'avg': avg_time, 'min': min_time, 'max': max_time}
+                Log_Print(f"  {cfg_name:<22} {avg_time:>8.2f}ms (min:{min_time:.2f}, max:{max_time:.2f})", logger)
+                
+                del model
+            except Exception as e:
+                Log_Print(f"  {cfg_name:<22} 失败: {e}", logger)
+        
+        all_results[model_name] = {'params': total_params, 'configs': model_results}
+        
+        # 该模型性能对比
+        if model_results:
+            Log_Print(f"\n  --- {model_name} 性能对比 ---", logger)
+            ref_time = model_results.get('Python-Original', list(model_results.values())[0])['avg']
+            for cfg_name, result in model_results.items():
+                speedup = ref_time / result['avg']
+                marker = "⭐" if speedup > 2.0 else ("✓" if speedup > 1.0 else "")
+                Log_Print(f"  {cfg_name:<22} {result['avg']:>8.2f}ms  {speedup:>5.2f}x {marker}", logger)
     
-    # 性能对比
-    if len(timings) > 1:
-        log_print("\n" + "=" * 80, logger)
-        log_print("性能对比", logger)
-        log_print("=" * 80, logger)
-        
-        ref_name = 'Python-Original' if 'Python-Original' in timings else list(timings.keys())[0]
-        ref_time = timings[ref_name]
-        
-        log_print(f"{'配置':<20} {'时间(ms)':<12} {'相对加速':<12} {'说明'}", logger)
-        log_print("-" * 80, logger)
-        
-        for name, avg_time in timings.items():
-            speedup = ref_time / avg_time
-            marker = "⭐" if speedup > 2.0 else ("✓" if speedup > 1.0 else "")
-            log_print(f"{name:<20} {avg_time:>8.2f} ms   {speedup:>6.2f}x      {marker}", logger)
+    # ==================== 汇总表格 ====================
+    Log_Print("\n" + "=" * 100, logger)
+    Log_Print("汇总表格：各模型各配置平均时间(ms)", logger)
+    Log_Print("=" * 100, logger)
+    
+    # 表头
+    header = f"{'配置':<22}"
+    for model_name in models_to_test:
+        params = all_results.get(model_name, {}).get('params', 0)
+        header += f" {model_name}({params/1e6:.1f}M):>14"
+    Log_Print(header, logger)
+    Log_Print("-" * 100, logger)
+    
+    # 数据行
+    for config in OPTIMIZATION_CONFIGS:
+        cfg_name = config['name']
+        row = f"{cfg_name:<22}"
+        for model_name in models_to_test:
+            model_data = all_results.get(model_name, {}).get('configs', {})
+            if cfg_name in model_data:
+                row += f" {model_data[cfg_name]['avg']:>14.2f}"
+            else:
+                row += f" {'N/A':>14}"
+        Log_Print(row, logger)
     
     # 总结
-    log_print("\n" + "=" * 80, logger)
-    log_print("测试总结", logger)
-    log_print("=" * 80, logger)
-    log_print(f"模型: Vim-tiny", logger)
-    if models:
-        first_model = list(models.values())[0]
-        log_print(f"参数量: {sum(p.numel() for p in first_model.parameters())/1e6:.2f}M", logger)
-    log_print(f"输入尺寸: {input_tensor.shape}", logger)
-    if outputs:
-        first_output = list(outputs.values())[0]
-        log_print(f"输出尺寸: {first_output.shape}", logger)
-    log_print(f"测试配置数: {len(timings)}", logger)
-    
-    # 记录结束时间
     end_time = datetime.now()
     elapsed = (end_time - start_time).total_seconds()
-    log_print(f"\n总耗时: {elapsed:.1f}秒", logger)
-    log_print("=" * 80, logger)
-    
-    log_print("\n测试结果已保存到 result.log", logger)
+    Log_Print(f"\n总耗时: {elapsed:.1f}秒", logger)
+    Log_Print("=" * 100, logger)
+    Log_Print("测试结果已保存到 test.log", logger)
 
 
 if __name__ == '__main__':

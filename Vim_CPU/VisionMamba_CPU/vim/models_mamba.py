@@ -36,6 +36,8 @@ if RMSNorm is None:
 __all__ = [
     'vim_tiny_patch16_224', 'vim_small_patch16_224', 'vim_base_patch16_224',
     'vim_tiny_patch16_384', 'vim_small_patch16_384', 'vim_base_patch16_384',
+    'vim_5m_patch16_224', 'vim_10m_patch16_224', 'vim_15m_patch16_224', 'vim_20m_patch16_224',
+    'vim_2gflops_patch16_224', 'vim_3gflops_patch16_224', 'vim_4gflops_patch16_224', 'vim_5gflops_patch16_224',
 ]
 
 
@@ -669,6 +671,194 @@ def vim_small_patch16_stride8_224_bimambav2_final_pool_mean_abs_pos_embed_with_m
 def vim_base_patch16_224_bimambav2_final_pool_mean_abs_pos_embed_with_middle_cls_token_div2(pretrained=False, **kwargs):
     model = VisionMamba(
         patch_size=16, embed_dim=768, d_state=16, depth=24, rms_norm=True, residual_in_fp32=True, fused_add_norm=True, final_pool_type='mean', if_abs_pos_embed=True, if_rope=False, if_rope_residual=False, bimamba_type="v2", if_cls_token=True, if_devide_out=True, use_middle_cls_token=True, **kwargs)
+    model.default_cfg = _cfg()
+    if pretrained:
+        checkpoint = torch.hub.load_state_dict_from_url(
+            url="to.do",
+            map_location="cpu", check_hash=True
+        )
+        model.load_state_dict(checkpoint["model"])
+    return model
+
+
+# ============= 不同参数量变体 =============
+# Presented by KeJi
+# Date: 2026-01-07
+
+@register_model
+def vim_5m_patch16_224_bimambav2(pretrained=False, **kwargs):
+    """
+    Vim-5M变体：约5M参数量
+    配置：embed_dim=160, depth=20
+    """
+    model = VisionMamba(
+        patch_size=16, embed_dim=192, d_state=16, depth=18,
+        rms_norm=True, residual_in_fp32=True, fused_add_norm=True,
+        final_pool_type='mean', if_abs_pos_embed=True, if_rope=False,
+        if_rope_residual=False, bimamba_type="v2", if_cls_token=True,
+        if_divide_out=True, use_middle_cls_token=True, **kwargs)
+    model.default_cfg = _cfg()
+    if pretrained:
+        checkpoint = torch.hub.load_state_dict_from_url(
+            url="to.do",
+            map_location="cpu", check_hash=True
+        )
+        model.load_state_dict(checkpoint["model"])
+    return model
+
+
+@register_model
+def vim_10m_patch16_224_bimambav2(pretrained=False, **kwargs):
+    """
+    Vim-10M变体：约10M参数量
+    配置：embed_dim=256, depth=20
+    """
+    model = VisionMamba(
+        patch_size=16, embed_dim=256, d_state=16, depth=20,
+        rms_norm=True, residual_in_fp32=True, fused_add_norm=True,
+        final_pool_type='mean', if_abs_pos_embed=True, if_rope=False,
+        if_rope_residual=False, bimamba_type="v2", if_cls_token=True,
+        if_divide_out=True, use_middle_cls_token=True, **kwargs)
+    model.default_cfg = _cfg()
+    if pretrained:
+        checkpoint = torch.hub.load_state_dict_from_url(
+            url="to.do",
+            map_location="cpu", check_hash=True
+        )
+        model.load_state_dict(checkpoint["model"])
+    return model
+
+
+@register_model
+def vim_15m_patch16_224_bimambav2(pretrained=False, **kwargs):
+    """
+    Vim-15M变体：约15M参数量
+    配置：embed_dim=288, depth=24
+    """
+    model = VisionMamba(
+        patch_size=16, embed_dim=288, d_state=16, depth=24,
+        rms_norm=True, residual_in_fp32=True, fused_add_norm=True,
+        final_pool_type='mean', if_abs_pos_embed=True, if_rope=False,
+        if_rope_residual=False, bimamba_type="v2", if_cls_token=True,
+        if_divide_out=True, use_middle_cls_token=True, **kwargs)
+    model.default_cfg = _cfg()
+    if pretrained:
+        checkpoint = torch.hub.load_state_dict_from_url(
+            url="to.do",
+            map_location="cpu", check_hash=True
+        )
+        model.load_state_dict(checkpoint["model"])
+    return model
+
+
+@register_model
+def vim_20m_patch16_224_bimambav2(pretrained=False, **kwargs):
+    """
+    Vim-20M变体：约20M参数量
+    配置：embed_dim=320, depth=26
+    """
+    model = VisionMamba(
+        patch_size=16, embed_dim=320, d_state=16, depth=26,
+        rms_norm=True, residual_in_fp32=True, fused_add_norm=True,
+        final_pool_type='mean', if_abs_pos_embed=True, if_rope=False,
+        if_rope_residual=False, bimamba_type="v2", if_cls_token=True,
+        if_divide_out=True, use_middle_cls_token=True, **kwargs)
+    model.default_cfg = _cfg()
+    if pretrained:
+        checkpoint = torch.hub.load_state_dict_from_url(
+            url="to.do",
+            map_location="cpu", check_hash=True
+        )
+        model.load_state_dict(checkpoint["model"])
+    return model
+
+
+# ============= 按FLOPs设计的模型变体 =============
+# Presented by KeJi
+# Date: 2026-01-07
+
+@register_model
+def vim_2gflops_patch16_224_bimambav2(pretrained=False, **kwargs):
+    """
+    Vim-2GFLOPs变体：约2G FLOPs
+    配置：embed_dim=224, depth=24
+    FLOPs估算：基于vim_tiny(D=192,depth=24≈1.5G)按D^2*depth缩放
+    """
+    model = VisionMamba(
+        patch_size=16, embed_dim=224, d_state=16, depth=24,
+        rms_norm=True, residual_in_fp32=True, fused_add_norm=True,
+        final_pool_type='mean', if_abs_pos_embed=True, if_rope=False,
+        if_rope_residual=False, bimamba_type="v2", if_cls_token=True,
+        if_divide_out=True, use_middle_cls_token=True, **kwargs)
+    model.default_cfg = _cfg()
+    if pretrained:
+        checkpoint = torch.hub.load_state_dict_from_url(
+            url="to.do",
+            map_location="cpu", check_hash=True
+        )
+        model.load_state_dict(checkpoint["model"])
+    return model
+
+
+@register_model
+def vim_3gflops_patch16_224_bimambav2(pretrained=False, **kwargs):
+    """
+    Vim-3GFLOPs变体：约3G FLOPs
+    配置：embed_dim=272, depth=26
+    FLOPs估算：基于vim_tiny(D=192,depth=24≈1.5G)按D^2*depth缩放
+    """
+    model = VisionMamba(
+        patch_size=16, embed_dim=272, d_state=16, depth=26,
+        rms_norm=True, residual_in_fp32=True, fused_add_norm=True,
+        final_pool_type='mean', if_abs_pos_embed=True, if_rope=False,
+        if_rope_residual=False, bimamba_type="v2", if_cls_token=True,
+        if_divide_out=True, use_middle_cls_token=True, **kwargs)
+    model.default_cfg = _cfg()
+    if pretrained:
+        checkpoint = torch.hub.load_state_dict_from_url(
+            url="to.do",
+            map_location="cpu", check_hash=True
+        )
+        model.load_state_dict(checkpoint["model"])
+    return model
+
+
+@register_model
+def vim_4gflops_patch16_224_bimambav2(pretrained=False, **kwargs):
+    """
+    Vim-4GFLOPs变体：约4G FLOPs
+    配置：embed_dim=304, depth=26
+    FLOPs估算：基于vim_tiny(D=192,depth=24≈1.5G)按D^2*depth缩放
+    """
+    model = VisionMamba(
+        patch_size=16, embed_dim=304, d_state=16, depth=26,
+        rms_norm=True, residual_in_fp32=True, fused_add_norm=True,
+        final_pool_type='mean', if_abs_pos_embed=True, if_rope=False,
+        if_rope_residual=False, bimamba_type="v2", if_cls_token=True,
+        if_divide_out=True, use_middle_cls_token=True, **kwargs)
+    model.default_cfg = _cfg()
+    if pretrained:
+        checkpoint = torch.hub.load_state_dict_from_url(
+            url="to.do",
+            map_location="cpu", check_hash=True
+        )
+        model.load_state_dict(checkpoint["model"])
+    return model
+
+
+@register_model
+def vim_5gflops_patch16_224_bimambav2(pretrained=False, **kwargs):
+    """
+    Vim-5GFLOPs变体：约5G FLOPs
+    配置：embed_dim=352, depth=26
+    FLOPs估算：基于vim_tiny(D=192,depth=24≈1.5G)按D^2*depth缩放
+    """
+    model = VisionMamba(
+        patch_size=16, embed_dim=352, d_state=16, depth=26,
+        rms_norm=True, residual_in_fp32=True, fused_add_norm=True,
+        final_pool_type='mean', if_abs_pos_embed=True, if_rope=False,
+        if_rope_residual=False, bimamba_type="v2", if_cls_token=True,
+        if_divide_out=True, use_middle_cls_token=True, **kwargs)
     model.default_cfg = _cfg()
     if pretrained:
         checkpoint = torch.hub.load_state_dict_from_url(

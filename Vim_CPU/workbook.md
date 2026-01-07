@@ -147,3 +147,63 @@ Target: 编写time_baseline.py测试ResNet和ViT推理时间
 - ResNet系列: ResNet-18(~11.7M), ResNet-34(~21.8M), ResNet-50(~25.6M)
 - ViT系列: ViT-Tiny(~5.7M), ViT-Small(~22M), ViT-Base(~86M)
 - 预热10次、推理100次
+
+## Task 9
+Start: 2026-01-07T12:17+08:00
+End: 2026-01-07T12:28+08:00
+Status: DONE
+Target: 添加5M/10M/15M/20M参数量模型变体，更新测试
+
+### Changes
+- models_mamba.py:36-40 更新__all__添加新模型
+- models_mamba.py:681-768 添加4个@register_model函数：
+  - vim_5m_patch16_224_bimambav2: embed_dim=160, depth=20 (~5M)
+  - vim_10m_patch16_224_bimambav2: embed_dim=256, depth=20 (~10M)
+  - vim_15m_patch16_224_bimambav2: embed_dim=288, depth=24 (~15M)
+  - vim_20m_patch16_224_bimambav2: embed_dim=320, depth=26 (~20M)
+- inf_cpu.py重写：
+  - 5种模型(vim_5m/vim_tiny/vim_10m/vim_15m/vim_20m)
+  - 每种模型测试16种优化配置(Python/C++/FullCPP/SIMD各4种)
+  - NUM_WARMUP=3, NUM_RUNS=10
+  - 输出汇总表格：各模型各配置平均时间
+  - 结果保存到test.log
+
+## Task 10
+Start: 2026-01-07T13:11+08:00
+End: 2026-01-07T13:14+08:00
+Status: DONE
+Target: 创建testflops.py统计vim_tiny的FLOPs，注册Mamba自定义算子
+
+### Output
+- VisionMamba_CPU/vim/testflops.py
+- Count_Mamba_Flops函数：计算Mamba层6部分FLOPs
+  - in_proj, conv1d, x_proj, dt_proj, Selective Scan(SSM), out_proj
+  - SSM公式: 3*L*B*D*N (状态更新+输出)
+  - 双向扫描*2
+- Register_Mamba_Hooks函数：注册到thop.profile.register_hooks
+- 增加理论值估算对比
+
+## Task 11
+Start: 2026-01-07T13:21+08:00
+End: 2026-01-07T13:25+08:00
+Status: DONE
+Target: 按FLOPs(2G/3G/4G/5G)增加模型变体，更新inf_cpu.py测试
+
+### Changes
+- models_mamba.py:41 __all__添加vim_2gflops/3gflops/4gflops/5gflops
+- models_mamba.py:773-856 添加4个@register_model函数(depth≤26)：
+  - vim_2gflops_patch16_224_bimambav2: embed_dim=224, depth=24 (~2G FLOPs)
+  - vim_3gflops_patch16_224_bimambav2: embed_dim=272, depth=26 (~3G FLOPs)
+  - vim_4gflops_patch16_224_bimambav2: embed_dim=304, depth=26 (~4G FLOPs)
+  - vim_5gflops_patch16_224_bimambav2: embed_dim=352, depth=26 (~5G FLOPs)
+- inf_cpu.py:42-54 MODEL_CONFIGS添加4个FLOPs模型
+- inf_cpu.py:185-191 models_to_test包含9种模型(5种参数量+4种FLOPs)
+- inf_cpu.py:7 文档说明更新为"9种模型"
+- inf_cpu.py:157 日志标题更新
+
+### FLOPs估算公式(depth≤26约束)
+- 基于vim_tiny(D=192,depth=24≈1.5G)按D^2*depth线性缩放
+- 2G: 224^2*24 = 1,204,224 (ratio=1.36)
+- 3G: 272^2*26 = 1,922,432 (ratio=2.17)
+- 4G: 304^2*26 = 2,403,136 (ratio=2.72)
+- 5G: 352^2*26 = 3,221,504 (ratio=3.64)
