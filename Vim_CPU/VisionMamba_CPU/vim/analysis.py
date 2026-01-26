@@ -5,7 +5,7 @@
 性能分析脚本 - 用于配合VTune/perf进行CPU性能分析
 
 功能：
-1. 创建~10M参数量的ResNet、ViT、Vim模型
+1. 创建标准模型：Vim Tiny (~7M), ResNet-50 (~25.6M), ViT-Small (~22M)
 2. 对于Vim支持16种优化配置选择
 3. 运行指定次数的推理，供性能分析工具采样
 
@@ -13,9 +13,9 @@
 =========
 
 基本用法：
-    python analysis.py --model resnet    # 测试ResNet
-    python analysis.py --model vit       # 测试ViT
-    python analysis.py --model vim       # 测试Vim (默认SIMD优化)
+    python analysis.py --model resnet    # 测试ResNet-50
+    python analysis.py --model vit       # 测试ViT-Small
+    python analysis.py --model vim       # 测试Vim Tiny (默认SIMD优化)
     
 Vim优化选项 (--optim参数)：
     python analysis.py --model vim --optim 0   # Python-Original
@@ -66,10 +66,10 @@ python analysis.py --model vit --runs 50
 
 预期对比结果：
 =============
-模型          IPC预期      L1 Miss预期     Backend Bound预期
-ResNet        2.0-3.0      < 5%            < 30%
-ViT           2.0-3.5      < 2%            < 30%
-Vim (SSM)     0.5-0.8      10-20%          60-70%
+模型              参数量       IPC预期      L1 Miss预期     Backend Bound预期
+Vim Tiny          ~7M          0.5-0.8      10-20%          60-70%
+ViT-Small         ~22M         2.0-3.5      < 2%            < 30%
+ResNet-50         ~25.6M       2.0-3.0      < 5%            < 30%
 """
 
 import os
@@ -100,7 +100,6 @@ if os.path.exists(modules_dir):
 # ==================== 配置 ====================
 IMG_SIZE = 224
 NUM_CLASSES = 1000
-TARGET_PARAMS = '10m'  # 目标~10M参数
 
 # Vim 16种优化配置
 VIM_OPTIMIZATION_CONFIGS = [
@@ -132,89 +131,26 @@ def Count_Params(model):
     return sum(p.numel() for p in model.parameters())
 
 
-def Create_Resnet_10M():
-    """创建~10M参数的ResNet"""
-    import torch.nn as nn
-    
-    class BasicBlock(nn.Module):
-        expansion = 1
-        
-        def __init__(self, in_planes, planes, stride=1):
-            super().__init__()
-            self.conv1 = nn.Conv2d(in_planes, planes, 3, stride, 1, bias=False)
-            self.bn1 = nn.BatchNorm2d(planes)
-            self.conv2 = nn.Conv2d(planes, planes, 3, 1, 1, bias=False)
-            self.bn2 = nn.BatchNorm2d(planes)
-            self.relu = nn.ReLU(inplace=True)
-            
-            self.shortcut = nn.Sequential()
-            if stride != 1 or in_planes != planes:
-                self.shortcut = nn.Sequential(
-                    nn.Conv2d(in_planes, planes, 1, stride, bias=False),
-                    nn.BatchNorm2d(planes)
-                )
-        
-        def forward(self, x):
-            out = self.relu(self.bn1(self.conv1(x)))
-            out = self.bn2(self.conv2(out))
-            out += self.shortcut(x)
-            return self.relu(out)
-    
-    class CustomResNet(nn.Module):
-        def __init__(self, block, num_blocks, width_mult=0.92, num_classes=1000):
-            super().__init__()
-            self.in_planes = int(64 * width_mult)
-            
-            self.conv1 = nn.Conv2d(3, self.in_planes, 7, 2, 3, bias=False)
-            self.bn1 = nn.BatchNorm2d(self.in_planes)
-            self.relu = nn.ReLU(inplace=True)
-            self.maxpool = nn.MaxPool2d(3, 2, 1)
-            
-            self.layer1 = self._make_layer(block, int(64*width_mult), num_blocks[0], 1)
-            self.layer2 = self._make_layer(block, int(128*width_mult), num_blocks[1], 2)
-            self.layer3 = self._make_layer(block, int(256*width_mult), num_blocks[2], 2)
-            self.layer4 = self._make_layer(block, int(512*width_mult), num_blocks[3], 2)
-            
-            self.avgpool = nn.AdaptiveAvgPool2d(1)
-            self.fc = nn.Linear(int(512*width_mult), num_classes)
-        
-        def _make_layer(self, block, planes, num_blocks, stride):
-            strides = [stride] + [1] * (num_blocks - 1)
-            layers = []
-            for s in strides:
-                layers.append(block(self.in_planes, planes, s))
-                self.in_planes = planes
-            return nn.Sequential(*layers)
-        
-        def forward(self, x):
-            x = self.maxpool(self.relu(self.bn1(self.conv1(x))))
-            x = self.layer1(x)
-            x = self.layer2(x)
-            x = self.layer3(x)
-            x = self.layer4(x)
-            x = self.avgpool(x)
-            x = x.view(x.size(0), -1)
-            return self.fc(x)
-    
-    model = CustomResNet(BasicBlock, [2, 2, 2, 2], width_mult=0.92)
-    model.eval()
-    return model
+def Create_Resnet50():
+    """创建ResNet-50模型 (~25.6M参数)"""
+    try:
+        from torchvision.models import resnet50
+        model = resnet50(weights=None, num_classes=NUM_CLASSES)
+        model.eval()
+        return model
+    except ImportError:
+        print("[ERROR] torchvision not available. Install with: pip install torchvision")
+        sys.exit(1)
 
 
-def Create_Vit_10M():
-    """创建~10M参数的ViT"""
+def Create_Vit_Small():
+    """创建ViT-Small模型 (~22M参数)"""
     try:
         import timm
-        model = timm.models.vision_transformer.VisionTransformer(
-            img_size=IMG_SIZE,
-            patch_size=16,
-            in_chans=3,
+        model = timm.create_model(
+            'vit_small_patch16_224',
+            pretrained=False,
             num_classes=NUM_CLASSES,
-            embed_dim=384,
-            depth=6,
-            num_heads=6,
-            mlp_ratio=4.0,
-            qkv_bias=True,
         )
         model.eval()
         return model
@@ -223,14 +159,14 @@ def Create_Vit_10M():
         sys.exit(1)
 
 
-def Create_Vim_10M(optim_config):
-    """创建~10M参数的Vim"""
+def Create_Vim_Tiny(optim_config):
+    """创建Vim Tiny模型 (~7M参数)"""
     try:
         from timm.models import create_model
         import models_mamba
         
         model = create_model(
-            'vim_10m_patch16_224_bimambav2',
+            'vim_tiny_patch16_224_bimambav2_final_pool_mean_abs_pos_embed_with_midclstok_div2',
             pretrained=False,
             num_classes=NUM_CLASSES,
             img_size=IMG_SIZE,
@@ -284,9 +220,9 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
-  python analysis.py --model resnet --runs 50      # 测试ResNet
-  python analysis.py --model vit --runs 50         # 测试ViT
-  python analysis.py --model vim --optim 12        # 测试Vim SIMD优化
+  python analysis.py --model resnet --runs 50      # 测试ResNet-50
+  python analysis.py --model vit --runs 50         # 测试ViT-Small
+  python analysis.py --model vim --optim 12        # 测试Vim Tiny SIMD优化
   
 配合VTune:
   vtune -collect uarch-exploration -- python analysis.py --model vim --runs 50
@@ -298,7 +234,7 @@ def main():
     
     parser.add_argument('--model', type=str, required=True, 
                         choices=['resnet', 'vit', 'vim'],
-                        help='模型类型: resnet, vit, vim')
+                        help='模型类型: resnet (ResNet-50), vit (ViT-Small), vim (Vim Tiny)')
     parser.add_argument('--optim', type=int, default=12,
                         help='Vim优化配置索引 (0-15)，默认12=SIMD')
     parser.add_argument('--runs', type=int, default=30,
@@ -339,17 +275,21 @@ def main():
     # 创建模型
     print("[INFO] Creating model...")
     if args.model == 'resnet':
-        model = Create_Resnet_10M()
+        model = Create_Resnet50()
+        model_name = "ResNet-50"
     elif args.model == 'vit':
-        model = Create_Vit_10M()
+        model = Create_Vit_Small()
+        model_name = "ViT-Small"
     elif args.model == 'vim':
         if args.optim < 0 or args.optim >= len(VIM_OPTIMIZATION_CONFIGS):
             print(f"[ERROR] Invalid optim index: {args.optim}. Use 0-15.")
             sys.exit(1)
         optim_config = VIM_OPTIMIZATION_CONFIGS[args.optim]
-        model = Create_Vim_10M(optim_config)
+        model = Create_Vim_Tiny(optim_config)
+        model_name = "Vim Tiny"
     
     params = Count_Params(model)
+    print(f"[INFO] Model: {model_name}")
     print(f"[INFO] Model parameters: {params:,} ({params/1e6:.2f}M)")
     print()
     

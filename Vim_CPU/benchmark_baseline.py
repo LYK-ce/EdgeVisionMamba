@@ -48,7 +48,7 @@ VIT_CONFIGS = {
     '20m': {'embed_dim': 384, 'depth': 12, 'num_heads': 6},  # ~20M
 }
 
-IMG_SIZE = 128
+IMG_SIZE = 224
 NUM_CLASSES = 1000
 
 
