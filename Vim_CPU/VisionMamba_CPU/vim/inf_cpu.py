@@ -38,7 +38,7 @@ if os.path.exists(modules_dir):
 from timm.models import create_model
 import models_mamba
 
-Img_size = 224
+Img_size = 160
 
 MODEL_CONFIGS = {
     # 按参数量分类
