@@ -38,6 +38,7 @@ if os.path.exists(modules_dir):
 from timm.models import create_model
 import models_mamba
 
+Img_size = 224
 
 MODEL_CONFIGS = {
     # 按参数量分类
@@ -89,6 +90,7 @@ def Create_Vim_Model(model_name='vim_tiny', use_cpp_scan=False, use_fixlen_scan=
         timm_name,
         pretrained=False,
         num_classes=1000,
+        img_size = Img_size,
         drop_rate=0.0,
         drop_path_rate=0.1,
         drop_block_rate=None,
@@ -158,6 +160,8 @@ def main():
     """主函数"""
     logger = Setup_Logging()
     start_time = datetime.now()
+
+
     
     Log_Print("=" * 100, logger)
     Log_Print("Vision Mamba CPU推理性能测试 - 9种模型(5种参数量+4种FLOPs) x 16种优化配置", logger)
@@ -177,13 +181,20 @@ def main():
     
     try:
         import vision_mamba_cpp
+            # 显示OpenMP信息
+        print(selective_scan_cpp.get_openmp_info())
+        # 输出: [OpenMP] 已启用: 可用处理器=8, 最大线程数=8
+
+        # 显示SIMD信息
+        print(selective_scan_cpp.get_simd_info())
+        # 输出: [SIMD] AVX/AVX2 (256位, 8x float)
         full_cpp_available = True
         Log_Print("全C++扩展: ✓", logger)
     except ImportError:
         full_cpp_available = False
         Log_Print("全C++扩展: ✗", logger)
     
-    input_tensor = torch.randn(1, 3, 224, 224)
+    input_tensor = torch.randn(1, 3, Img_size, Img_size)
     NUM_WARMUP = 3
     NUM_RUNS = 10
     Log_Print(f"\n输入: {input_tensor.shape}, 预热: {NUM_WARMUP}次, 测试: {NUM_RUNS}次", logger)
@@ -193,7 +204,7 @@ def main():
         # 按参数量
         'vim_5m', 'vim_tiny', 'vim_10m', 'vim_15m', 'vim_20m',
         # 按FLOPs
-        'vim_2gflops', 'vim_3gflops', 'vim_4gflops', 'vim_5gflops',
+        # 'vim_2gflops', 'vim_3gflops', 'vim_4gflops', 'vim_5gflops',
     ]
     all_results = {}
     

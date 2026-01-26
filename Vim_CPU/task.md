@@ -31,3 +31,5 @@
 10. 我们已经安装了thop库，先写个简单testflops.py看看vim tiny的FLOPs是多少
     完成
 11. 现在继续增加模型，按照FLOPs在2G，3G，4G，5G设置模型，仍然通过调整模型深度，宽度来调整FLOPs，然后在inf cpu.py当中，增加这些模型的测试，同样的每一个模型也都要测试16种优化配置方案
+    完成
+12. 现在，浏览C:\workspace\Workspace\Workspace\EdgeMamba\Vim_CPU 目录，为了在cpu上高效运行vim model，我们一共使用了3种优化方案，分别是fix len优化，fused 优化以及SIMD优化。整理这些优化方案的思路，把它们写到C:\workspace\Workspace\Workspace\EdgeMamba\cpu optimization.md当中，当然名称要更加正式一点，fix len我们把它命名为loop optimization， fused优化则命名为bidirectional scan fusion 优化，最后一种还是叫SIMD优化。

@@ -40,9 +40,40 @@
 
 /*
  * Vision Mamba Selective Scan C++ 完整实现
- * 
+ *
  * 完全复刻selective_scan_interface.py:235的selective_scan_ref函数
  */
+
+// 获取OpenMP信息的辅助函数
+std::string Get_Openmp_Info() {
+    std::string info;
+#if defined(_OPENMP)
+    int max_threads = omp_get_max_threads();
+    int num_procs = omp_get_num_procs();
+    info = "[OpenMP] =" + std::to_string(num_procs) +
+           ", max thread=" + std::to_string(max_threads);
+#else
+    info = "[OpenMP] open";
+#endif
+    return info;
+}
+
+// 获取SIMD信息的辅助函数
+std::string Get_Simd_Info() {
+    std::string info = "[SIMD] ";
+#if defined(HAS_AVX512)
+    info += "AVX-512 (512bit, 16x float)";
+#elif defined(HAS_AVX)
+    info += "AVX/AVX2 (256bit, 8x float)";
+#elif defined(HAS_SSE)
+    info += "SSE (128bit, 4x float)";
+#elif defined(HAS_NEON)
+    info += "NEON (128bit, 4x float)";
+#else
+    info += "scalar (no SIMD)";
+#endif
+    return info;
+}
 
 // 辅助函数：检查tensor是否为None
 inline bool is_none(const torch::Tensor& t) {
@@ -838,15 +869,133 @@ torch::Tensor Selective_Scan_Simd_Fixlen_Cpu(
         }
     }
     
-    // 阶段2：批量计算输出
-    torch::Tensor y;
-    if (!is_variable_C) {
-        y = torch::sum(deltaB_u * C_f.unsqueeze(0).unsqueeze(2), -1);
-    } else {
+    // 阶段2：SIMD批量计算输出（替换原来的torch::sum）
+    // === 原始实现（已注释，保留用于回退） ===
+    // torch::Tensor y;
+    // if (!is_variable_C) {
+    //     y = torch::sum(deltaB_u * C_f.unsqueeze(0).unsqueeze(2), -1);
+    // } else {
+    //     if (C_f.dim() == 3) {
+    //         y = torch::sum(deltaB_u * C_f.unsqueeze(1).transpose(2, 3), -1);
+    //     } else {
+    //         throw std::runtime_error("Grouped C not supported");
+    //     }
+    // }
+    // === SIMD优化实现 ===
+    
+    // 准备C矩阵指针
+    torch::Tensor C_t;
+    if (is_variable_C) {
         if (C_f.dim() == 3) {
-            y = torch::sum(deltaB_u * C_f.unsqueeze(1).transpose(2, 3), -1);
+            C_t = C_f.transpose(1, 2).contiguous();  // (B, N, L) -> (B, L, N)
         } else {
-            throw std::runtime_error("Grouped C not supported");
+            throw std::runtime_error("Grouped C not supported in SIMD version");
+        }
+    }
+    float* C_ptr = is_variable_C ? C_t.data_ptr<float>() : C_f.data_ptr<float>();
+    
+    // 分配输出tensor
+    auto y = torch::empty({batch, dim, seq_len}, deltaB_u.options());
+    float* y_ptr = y.data_ptr<float>();
+    
+    // SIMD阶段2：计算输出 y = sum(deltaB_u * C, -1)
+    #if defined(_OPENMP)
+    #pragma omp parallel for collapse(2) schedule(static)
+    #endif
+    for (int64_t b = 0; b < batch; b++) {
+        for (int64_t d = 0; d < dim; d++) {
+            for (int64_t l = 0; l < seq_len; l++) {
+                const int64_t x_base = ((b * dim + d) * seq_len + l) * dstate;
+                const int64_t y_idx = (b * dim + d) * seq_len + l;
+                
+                float sum = 0.0f;
+                int64_t n = 0;
+                
+#if defined(HAS_AVX512)
+                __m512 acc_512 = _mm512_setzero_ps();
+                for (; n + 16 <= dstate; n += 16) {
+                    __m512 x_v = _mm512_loadu_ps(&deltaB_u_ptr[x_base + n]);
+                    __m512 c_v;
+                    if (is_variable_C) {
+                        const int64_t c_idx = (b * seq_len + l) * dstate + n;
+                        c_v = _mm512_loadu_ps(&C_ptr[c_idx]);
+                    } else {
+                        const int64_t c_idx = d * dstate + n;
+                        c_v = _mm512_loadu_ps(&C_ptr[c_idx]);
+                    }
+                    acc_512 = _mm512_fmadd_ps(x_v, c_v, acc_512);
+                }
+                sum += Horizontal_Sum_Avx512(acc_512);
+#endif
+
+#if defined(HAS_AVX) || defined(_MSC_VER)
+                __m256 acc_256 = _mm256_setzero_ps();
+                for (; n + 8 <= dstate; n += 8) {
+                    __m256 x_v = _mm256_loadu_ps(&deltaB_u_ptr[x_base + n]);
+                    __m256 c_v;
+                    if (is_variable_C) {
+                        const int64_t c_idx = (b * seq_len + l) * dstate + n;
+                        c_v = _mm256_loadu_ps(&C_ptr[c_idx]);
+                    } else {
+                        const int64_t c_idx = d * dstate + n;
+                        c_v = _mm256_loadu_ps(&C_ptr[c_idx]);
+                    }
+                    #if defined(__FMA__)
+                    acc_256 = _mm256_fmadd_ps(x_v, c_v, acc_256);
+                    #else
+                    acc_256 = _mm256_add_ps(acc_256, _mm256_mul_ps(x_v, c_v));
+                    #endif
+                }
+                sum += Horizontal_Sum_Avx(acc_256);
+#endif
+
+#if defined(HAS_SSE)
+                __m128 acc_128 = _mm_setzero_ps();
+                for (; n + 4 <= dstate; n += 4) {
+                    __m128 x_v = _mm_loadu_ps(&deltaB_u_ptr[x_base + n]);
+                    __m128 c_v;
+                    if (is_variable_C) {
+                        const int64_t c_idx = (b * seq_len + l) * dstate + n;
+                        c_v = _mm_loadu_ps(&C_ptr[c_idx]);
+                    } else {
+                        const int64_t c_idx = d * dstate + n;
+                        c_v = _mm_loadu_ps(&C_ptr[c_idx]);
+                    }
+                    acc_128 = _mm_add_ps(acc_128, _mm_mul_ps(x_v, c_v));
+                }
+                sum += Horizontal_Sum_Sse(acc_128);
+#endif
+
+#if defined(HAS_NEON)
+                float32x4_t acc_neon = vdupq_n_f32(0.0f);
+                for (; n + 4 <= dstate; n += 4) {
+                    float32x4_t x_v = vld1q_f32(&deltaB_u_ptr[x_base + n]);
+                    float32x4_t c_v;
+                    if (is_variable_C) {
+                        const int64_t c_idx = (b * seq_len + l) * dstate + n;
+                        c_v = vld1q_f32(&C_ptr[c_idx]);
+                    } else {
+                        const int64_t c_idx = d * dstate + n;
+                        c_v = vld1q_f32(&C_ptr[c_idx]);
+                    }
+                    acc_neon = vmlaq_f32(acc_neon, x_v, c_v);
+                }
+                sum += Horizontal_Sum_Neon(acc_neon);
+#endif
+                
+                // 标量回退处理剩余元素
+                for (; n < dstate; n++) {
+                    float c_val;
+                    if (is_variable_C) {
+                        c_val = C_ptr[(b * seq_len + l) * dstate + n];
+                    } else {
+                        c_val = C_ptr[d * dstate + n];
+                    }
+                    sum += deltaB_u_ptr[x_base + n] * c_val;
+                }
+                
+                y_ptr[y_idx] = sum;
+            }
         }
     }
     
@@ -929,33 +1078,78 @@ torch::Tensor Selective_Fused_Scan_Simd_Cpu(
     
     const int64_t dstate2 = 2 * dstate;
     
-    // SIMD主循环：连续处理fwd再处理bwd（优化内存访问模式 + OpenMP并行）
+    // ========== 方案：只融合状态更新 ==========
+    // 状态更新：一次处理2N个连续元素（fwd+bwd一起更新）
+    // 输出计算：分别计算fwd和bwd的输出
+    // 好处：状态更新利用2N=32个元素，更好利用SIMD宽度；内存访问连续
+    
     #if defined(_OPENMP)
     #pragma omp parallel for collapse(2) schedule(static)
     #endif
     for (int64_t b = 0; b < batch; b++) {
         for (int64_t d = 0; d < dim; d++) {
-            const int64_t x_base_fwd = (b * dim + d) * dstate2;
-            const int64_t x_base_bwd = x_base_fwd + dstate;
+            const int64_t x_base = (b * dim + d) * dstate2;  // 隐藏状态基址 (2N连续)
             
             for (int64_t i = 0; i < seq_len; i++) {
                 const int64_t dA_base = ((b * dim + d) * seq_len + i) * dstate2;
-                const int64_t dA_base_bwd = dA_base + dstate;
                 const int64_t y_idx = (b * dim + d) * seq_len + i;
                 const int64_t c_base = (b * seq_len + i) * dstate;
                 
-                float sum_fwd = 0.0f, sum_bwd = 0.0f;
-                
-                // === 先完整处理正向（连续内存访问）===
+                // === 阶段1：融合状态更新（一次处理2N个元素） ===
                 int64_t n = 0;
 #if defined(HAS_AVX512)
-                __m512 acc_fwd_512 = _mm512_setzero_ps();
-                for (; n + 16 <= dstate; n += 16) {
-                    __m512 x_v = _mm512_loadu_ps(&x_ptr[x_base_fwd + n]);
+                for (; n + 16 <= dstate2; n += 16) {
+                    __m512 x_v = _mm512_loadu_ps(&x_ptr[x_base + n]);
                     __m512 dA_v = _mm512_loadu_ps(&deltaA_ptr[dA_base + n]);
                     __m512 dBu_v = _mm512_loadu_ps(&deltaB_u_ptr[dA_base + n]);
                     x_v = _mm512_fmadd_ps(dA_v, x_v, dBu_v);
-                    _mm512_storeu_ps(&x_ptr[x_base_fwd + n], x_v);
+                    _mm512_storeu_ps(&x_ptr[x_base + n], x_v);
+                }
+#endif
+#if defined(HAS_AVX) || defined(_MSC_VER)
+                for (; n + 8 <= dstate2; n += 8) {
+                    __m256 x_v = _mm256_loadu_ps(&x_ptr[x_base + n]);
+                    __m256 dA_v = _mm256_loadu_ps(&deltaA_ptr[dA_base + n]);
+                    __m256 dBu_v = _mm256_loadu_ps(&deltaB_u_ptr[dA_base + n]);
+                    #if defined(__FMA__)
+                    x_v = _mm256_fmadd_ps(dA_v, x_v, dBu_v);
+                    #else
+                    x_v = _mm256_add_ps(_mm256_mul_ps(dA_v, x_v), dBu_v);
+                    #endif
+                    _mm256_storeu_ps(&x_ptr[x_base + n], x_v);
+                }
+#endif
+#if defined(HAS_SSE)
+                for (; n + 4 <= dstate2; n += 4) {
+                    __m128 x_v = _mm_loadu_ps(&x_ptr[x_base + n]);
+                    __m128 dA_v = _mm_loadu_ps(&deltaA_ptr[dA_base + n]);
+                    __m128 dBu_v = _mm_loadu_ps(&deltaB_u_ptr[dA_base + n]);
+                    x_v = _mm_add_ps(_mm_mul_ps(dA_v, x_v), dBu_v);
+                    _mm_storeu_ps(&x_ptr[x_base + n], x_v);
+                }
+#endif
+#if defined(HAS_NEON)
+                for (; n + 4 <= dstate2; n += 4) {
+                    float32x4_t x_v = vld1q_f32(&x_ptr[x_base + n]);
+                    float32x4_t dA_v = vld1q_f32(&deltaA_ptr[dA_base + n]);
+                    float32x4_t dBu_v = vld1q_f32(&deltaB_u_ptr[dA_base + n]);
+                    x_v = vmlaq_f32(dBu_v, dA_v, x_v);
+                    vst1q_f32(&x_ptr[x_base + n], x_v);
+                }
+#endif
+                // 标量处理剩余元素
+                for (; n < dstate2; n++) {
+                    x_ptr[x_base + n] = deltaA_ptr[dA_base + n] * x_ptr[x_base + n] + deltaB_u_ptr[dA_base + n];
+                }
+                
+                // === 阶段2：分别计算输出 ===
+                // 正向输出：y_fwd = sum(x_fwd * C_fwd)
+                float sum_fwd = 0.0f;
+                n = 0;
+#if defined(HAS_AVX512)
+                __m512 acc_fwd_512 = _mm512_setzero_ps();
+                for (; n + 16 <= dstate; n += 16) {
+                    __m512 x_v = _mm512_loadu_ps(&x_ptr[x_base + n]);  // x_fwd部分
                     __m512 c_v = _mm512_loadu_ps(&C_fwd_ptr[c_base + n]);
                     acc_fwd_512 = _mm512_fmadd_ps(x_v, c_v, acc_fwd_512);
                 }
@@ -964,15 +1158,7 @@ torch::Tensor Selective_Fused_Scan_Simd_Cpu(
 #if defined(HAS_AVX) || defined(_MSC_VER)
                 __m256 acc_fwd_256 = _mm256_setzero_ps();
                 for (; n + 8 <= dstate; n += 8) {
-                    __m256 x_v = _mm256_loadu_ps(&x_ptr[x_base_fwd + n]);
-                    __m256 dA_v = _mm256_loadu_ps(&deltaA_ptr[dA_base + n]);
-                    __m256 dBu_v = _mm256_loadu_ps(&deltaB_u_ptr[dA_base + n]);
-                    #if defined(__FMA__)
-                    x_v = _mm256_fmadd_ps(dA_v, x_v, dBu_v);
-                    #else
-                    x_v = _mm256_add_ps(_mm256_mul_ps(dA_v, x_v), dBu_v);
-                    #endif
-                    _mm256_storeu_ps(&x_ptr[x_base_fwd + n], x_v);
+                    __m256 x_v = _mm256_loadu_ps(&x_ptr[x_base + n]);
                     __m256 c_v = _mm256_loadu_ps(&C_fwd_ptr[c_base + n]);
                     #if defined(__FMA__)
                     acc_fwd_256 = _mm256_fmadd_ps(x_v, c_v, acc_fwd_256);
@@ -985,11 +1171,7 @@ torch::Tensor Selective_Fused_Scan_Simd_Cpu(
 #if defined(HAS_SSE)
                 __m128 acc_fwd_128 = _mm_setzero_ps();
                 for (; n + 4 <= dstate; n += 4) {
-                    __m128 x_v = _mm_loadu_ps(&x_ptr[x_base_fwd + n]);
-                    __m128 dA_v = _mm_loadu_ps(&deltaA_ptr[dA_base + n]);
-                    __m128 dBu_v = _mm_loadu_ps(&deltaB_u_ptr[dA_base + n]);
-                    x_v = _mm_add_ps(_mm_mul_ps(dA_v, x_v), dBu_v);
-                    _mm_storeu_ps(&x_ptr[x_base_fwd + n], x_v);
+                    __m128 x_v = _mm_loadu_ps(&x_ptr[x_base + n]);
                     __m128 c_v = _mm_loadu_ps(&C_fwd_ptr[c_base + n]);
                     acc_fwd_128 = _mm_add_ps(acc_fwd_128, _mm_mul_ps(x_v, c_v));
                 }
@@ -998,32 +1180,24 @@ torch::Tensor Selective_Fused_Scan_Simd_Cpu(
 #if defined(HAS_NEON)
                 float32x4_t acc_fwd_neon = vdupq_n_f32(0.0f);
                 for (; n + 4 <= dstate; n += 4) {
-                    float32x4_t x_v = vld1q_f32(&x_ptr[x_base_fwd + n]);
-                    float32x4_t dA_v = vld1q_f32(&deltaA_ptr[dA_base + n]);
-                    float32x4_t dBu_v = vld1q_f32(&deltaB_u_ptr[dA_base + n]);
-                    x_v = vmlaq_f32(dBu_v, dA_v, x_v);
-                    vst1q_f32(&x_ptr[x_base_fwd + n], x_v);
+                    float32x4_t x_v = vld1q_f32(&x_ptr[x_base + n]);
                     float32x4_t c_v = vld1q_f32(&C_fwd_ptr[c_base + n]);
                     acc_fwd_neon = vmlaq_f32(acc_fwd_neon, x_v, c_v);
                 }
                 sum_fwd += Horizontal_Sum_Neon(acc_fwd_neon);
 #endif
                 for (; n < dstate; n++) {
-                    float x_val = deltaA_ptr[dA_base + n] * x_ptr[x_base_fwd + n] + deltaB_u_ptr[dA_base + n];
-                    x_ptr[x_base_fwd + n] = x_val;
-                    sum_fwd += x_val * C_fwd_ptr[c_base + n];
+                    sum_fwd += x_ptr[x_base + n] * C_fwd_ptr[c_base + n];
                 }
                 
-                // === 再完整处理反向（连续内存访问）===
+                // 反向输出：y_bwd = sum(x_bwd * C_bwd)
+                float sum_bwd = 0.0f;
+                const int64_t x_base_bwd = x_base + dstate;  // x_bwd在x_fwd之后
                 n = 0;
 #if defined(HAS_AVX512)
                 __m512 acc_bwd_512 = _mm512_setzero_ps();
                 for (; n + 16 <= dstate; n += 16) {
                     __m512 x_v = _mm512_loadu_ps(&x_ptr[x_base_bwd + n]);
-                    __m512 dA_v = _mm512_loadu_ps(&deltaA_ptr[dA_base_bwd + n]);
-                    __m512 dBu_v = _mm512_loadu_ps(&deltaB_u_ptr[dA_base_bwd + n]);
-                    x_v = _mm512_fmadd_ps(dA_v, x_v, dBu_v);
-                    _mm512_storeu_ps(&x_ptr[x_base_bwd + n], x_v);
                     __m512 c_v = _mm512_loadu_ps(&C_bwd_ptr[c_base + n]);
                     acc_bwd_512 = _mm512_fmadd_ps(x_v, c_v, acc_bwd_512);
                 }
@@ -1033,14 +1207,6 @@ torch::Tensor Selective_Fused_Scan_Simd_Cpu(
                 __m256 acc_bwd_256 = _mm256_setzero_ps();
                 for (; n + 8 <= dstate; n += 8) {
                     __m256 x_v = _mm256_loadu_ps(&x_ptr[x_base_bwd + n]);
-                    __m256 dA_v = _mm256_loadu_ps(&deltaA_ptr[dA_base_bwd + n]);
-                    __m256 dBu_v = _mm256_loadu_ps(&deltaB_u_ptr[dA_base_bwd + n]);
-                    #if defined(__FMA__)
-                    x_v = _mm256_fmadd_ps(dA_v, x_v, dBu_v);
-                    #else
-                    x_v = _mm256_add_ps(_mm256_mul_ps(dA_v, x_v), dBu_v);
-                    #endif
-                    _mm256_storeu_ps(&x_ptr[x_base_bwd + n], x_v);
                     __m256 c_v = _mm256_loadu_ps(&C_bwd_ptr[c_base + n]);
                     #if defined(__FMA__)
                     acc_bwd_256 = _mm256_fmadd_ps(x_v, c_v, acc_bwd_256);
@@ -1054,10 +1220,6 @@ torch::Tensor Selective_Fused_Scan_Simd_Cpu(
                 __m128 acc_bwd_128 = _mm_setzero_ps();
                 for (; n + 4 <= dstate; n += 4) {
                     __m128 x_v = _mm_loadu_ps(&x_ptr[x_base_bwd + n]);
-                    __m128 dA_v = _mm_loadu_ps(&deltaA_ptr[dA_base_bwd + n]);
-                    __m128 dBu_v = _mm_loadu_ps(&deltaB_u_ptr[dA_base_bwd + n]);
-                    x_v = _mm_add_ps(_mm_mul_ps(dA_v, x_v), dBu_v);
-                    _mm_storeu_ps(&x_ptr[x_base_bwd + n], x_v);
                     __m128 c_v = _mm_loadu_ps(&C_bwd_ptr[c_base + n]);
                     acc_bwd_128 = _mm_add_ps(acc_bwd_128, _mm_mul_ps(x_v, c_v));
                 }
@@ -1067,19 +1229,13 @@ torch::Tensor Selective_Fused_Scan_Simd_Cpu(
                 float32x4_t acc_bwd_neon = vdupq_n_f32(0.0f);
                 for (; n + 4 <= dstate; n += 4) {
                     float32x4_t x_v = vld1q_f32(&x_ptr[x_base_bwd + n]);
-                    float32x4_t dA_v = vld1q_f32(&deltaA_ptr[dA_base_bwd + n]);
-                    float32x4_t dBu_v = vld1q_f32(&deltaB_u_ptr[dA_base_bwd + n]);
-                    x_v = vmlaq_f32(dBu_v, dA_v, x_v);
-                    vst1q_f32(&x_ptr[x_base_bwd + n], x_v);
                     float32x4_t c_v = vld1q_f32(&C_bwd_ptr[c_base + n]);
                     acc_bwd_neon = vmlaq_f32(acc_bwd_neon, x_v, c_v);
                 }
                 sum_bwd += Horizontal_Sum_Neon(acc_bwd_neon);
 #endif
                 for (; n < dstate; n++) {
-                    float x_val = deltaA_ptr[dA_base_bwd + n] * x_ptr[x_base_bwd + n] + deltaB_u_ptr[dA_base_bwd + n];
-                    x_ptr[x_base_bwd + n] = x_val;
-                    sum_bwd += x_val * C_bwd_ptr[c_base + n];
+                    sum_bwd += x_ptr[x_base_bwd + n] * C_bwd_ptr[c_base + n];
                 }
                 
                 y_fwd_ptr[y_idx] = sum_fwd;
@@ -1243,6 +1399,12 @@ torch::Tensor Selective_Fused_Scan_Simd_Fixlen_Cpu(
 
 // Python绑定
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    // 信息查询函数
+    m.def("get_openmp_info", &Get_Openmp_Info,
+          "Get OpenMP configuration info (thread count, processor count)");
+    m.def("get_simd_info", &Get_Simd_Info,
+          "Get SIMD instruction set info (AVX512/AVX/SSE/NEON)");
+    
     m.def("selective_scan", &Selective_Scan_Ref_Cpu,
           "Selective Scan CPU - complete replication of selective_scan_ref",
           py::arg("u"),

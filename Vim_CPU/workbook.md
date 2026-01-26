@@ -207,3 +207,17 @@ Target: 按FLOPs(2G/3G/4G/5G)增加模型变体，更新inf_cpu.py测试
 - 3G: 272^2*26 = 1,922,432 (ratio=2.17)
 - 4G: 304^2*26 = 2,403,136 (ratio=2.72)
 - 5G: 352^2*26 = 3,221,504 (ratio=3.64)
+
+## Task 12
+Start: 2026-01-25T14:20+08:00
+End: 2026-01-25T14:22+08:00
+Status: DONE
+Target: 整理CPU优化方案到cpu optimization.md
+
+### Output
+- cpu optimization.md (根目录)
+- 三种优化方案正式命名:
+  1. Loop Optimization (原fixlen): 分离状态递推与输出计算
+  2. Bidirectional Scan Fusion (原fused): N维度拼接融合双向扫描
+  3. SIMD Optimization: AVX-512/AVX2/SSE/NEON向量化
+- 包含: 背景、问题、解决方案、代码示例、加速比、组合配置表

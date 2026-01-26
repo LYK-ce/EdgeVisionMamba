@@ -17,7 +17,7 @@ rule compile
 
 
 
-build C$:\workspace\Workspace\Workspace\EdgeMamba\Tmp\VisionMamba_CPU\mamba-1p1p1\mamba_ssm\ops\build\temp.win-amd64-cpython-313\Release\selective_scan.obj: compile C$:\workspace\Workspace\Workspace\EdgeMamba\Tmp\VisionMamba_CPU\mamba-1p1p1\mamba_ssm\ops\selective_scan.cpp
+build C$:\workspace\Workspace\Workspace\EdgeMamba\Vim_CPU\VisionMamba_CPU\mamba-1p1p1\mamba_ssm\ops\build\temp.win-amd64-cpython-313\Release\selective_scan.obj: compile C$:\workspace\Workspace\Workspace\EdgeMamba\Vim_CPU\VisionMamba_CPU\mamba-1p1p1\mamba_ssm\ops\selective_scan.cpp
 
 
 
