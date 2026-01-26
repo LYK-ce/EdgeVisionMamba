@@ -19,6 +19,11 @@ import platform
 import sys
 from datetime import datetime
 
+# 强制使用CPU，禁用CUDA
+import os
+os.environ['CUDA_VISIBLE_DEVICES'] = ''
+torch.set_default_device('cpu')
+
 # 尝试导入timm
 try:
     import timm
@@ -217,7 +222,8 @@ def main():
     print("=" * 80)
     print(f"测试时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"平台: {platform.machine()}")
-    print(f"PyTorch: {torch.__version__}")
+    print(f"PyTorch: {torch.__version__} (CPU模式)")
+    print(f"CUDA可用: {torch.cuda.is_available()} (已禁用)")
     print(f"CPU线程: {torch.get_num_threads()}")
     
     if not TIMM_AVAILABLE:
