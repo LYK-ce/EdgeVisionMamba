@@ -1370,13 +1370,130 @@ torch::Tensor Selective_Fused_Scan_Simd_Fixlen_Cpu(
         }
     }
     
-    // 阶段2：分离并计算输出
-    auto deltaB_u_fwd = deltaB_u_bi.narrow(3, 0, dstate);
-    auto deltaB_u_bwd = deltaB_u_bi.narrow(3, dstate, dstate);
+    // 阶段2：SIMD计算输出（替换torch::sum）
+    // C矩阵转置为(B,L,N)
+    auto C_fwd_t = C_fwd.transpose(1, 2).contiguous();  // (B, L, N)
+    auto C_bwd_t = C_bwd.transpose(1, 2).contiguous();  // (B, L, N)
+    float* C_fwd_ptr = C_fwd_t.data_ptr<float>();
+    float* C_bwd_ptr = C_bwd_t.data_ptr<float>();
     
-    // 批量计算输出
-    auto y_fwd = torch::sum(deltaB_u_fwd * C_fwd.unsqueeze(1).transpose(2, 3), -1);
-    auto y_bwd = torch::sum(deltaB_u_bwd * C_bwd.unsqueeze(1).transpose(2, 3), -1);
+    // 分配输出tensor
+    auto y_fwd = torch::empty({batch, dim, seq_len}, dt_fwd.options().dtype(torch::kFloat32));
+    auto y_bwd = torch::empty({batch, dim, seq_len}, dt_fwd.options().dtype(torch::kFloat32));
+    float* y_fwd_ptr = y_fwd.data_ptr<float>();
+    float* y_bwd_ptr = y_bwd.data_ptr<float>();
+    
+    // SIMD阶段2：计算输出 y_fwd = sum(deltaB_u_fwd * C_fwd), y_bwd = sum(deltaB_u_bwd * C_bwd)
+    #if defined(_OPENMP)
+    #pragma omp parallel for collapse(2) schedule(static)
+    #endif
+    for (int64_t b = 0; b < batch; b++) {
+        for (int64_t d = 0; d < dim; d++) {
+            for (int64_t l = 0; l < seq_len; l++) {
+                const int64_t x_base = ((b * dim + d) * seq_len + l) * dstate2;
+                const int64_t y_idx = (b * dim + d) * seq_len + l;
+                const int64_t c_base = (b * seq_len + l) * dstate;
+                
+                // 正向输出
+                float sum_fwd = 0.0f;
+                int64_t n = 0;
+#if defined(HAS_AVX512)
+                __m512 acc_fwd_512 = _mm512_setzero_ps();
+                for (; n + 16 <= dstate; n += 16) {
+                    __m512 x_v = _mm512_loadu_ps(&deltaB_u_ptr[x_base + n]);
+                    __m512 c_v = _mm512_loadu_ps(&C_fwd_ptr[c_base + n]);
+                    acc_fwd_512 = _mm512_fmadd_ps(x_v, c_v, acc_fwd_512);
+                }
+                sum_fwd = Horizontal_Sum_Avx512(acc_fwd_512);
+#endif
+#if defined(HAS_AVX) || defined(_MSC_VER)
+                __m256 acc_fwd_256 = _mm256_setzero_ps();
+                for (; n + 8 <= dstate; n += 8) {
+                    __m256 x_v = _mm256_loadu_ps(&deltaB_u_ptr[x_base + n]);
+                    __m256 c_v = _mm256_loadu_ps(&C_fwd_ptr[c_base + n]);
+                    #if defined(__FMA__)
+                    acc_fwd_256 = _mm256_fmadd_ps(x_v, c_v, acc_fwd_256);
+                    #else
+                    acc_fwd_256 = _mm256_add_ps(acc_fwd_256, _mm256_mul_ps(x_v, c_v));
+                    #endif
+                }
+                sum_fwd += Horizontal_Sum_Avx(acc_fwd_256);
+#endif
+#if defined(HAS_SSE)
+                __m128 acc_fwd_128 = _mm_setzero_ps();
+                for (; n + 4 <= dstate; n += 4) {
+                    __m128 x_v = _mm_loadu_ps(&deltaB_u_ptr[x_base + n]);
+                    __m128 c_v = _mm_loadu_ps(&C_fwd_ptr[c_base + n]);
+                    acc_fwd_128 = _mm_add_ps(acc_fwd_128, _mm_mul_ps(x_v, c_v));
+                }
+                sum_fwd += Horizontal_Sum_Sse(acc_fwd_128);
+#endif
+#if defined(HAS_NEON)
+                float32x4_t acc_fwd_neon = vdupq_n_f32(0.0f);
+                for (; n + 4 <= dstate; n += 4) {
+                    float32x4_t x_v = vld1q_f32(&deltaB_u_ptr[x_base + n]);
+                    float32x4_t c_v = vld1q_f32(&C_fwd_ptr[c_base + n]);
+                    acc_fwd_neon = vmlaq_f32(acc_fwd_neon, x_v, c_v);
+                }
+                sum_fwd += Horizontal_Sum_Neon(acc_fwd_neon);
+#endif
+                for (; n < dstate; n++) {
+                    sum_fwd += deltaB_u_ptr[x_base + n] * C_fwd_ptr[c_base + n];
+                }
+                
+                // 反向输出
+                float sum_bwd = 0.0f;
+                const int64_t x_base_bwd = x_base + dstate;
+                n = 0;
+#if defined(HAS_AVX512)
+                __m512 acc_bwd_512 = _mm512_setzero_ps();
+                for (; n + 16 <= dstate; n += 16) {
+                    __m512 x_v = _mm512_loadu_ps(&deltaB_u_ptr[x_base_bwd + n]);
+                    __m512 c_v = _mm512_loadu_ps(&C_bwd_ptr[c_base + n]);
+                    acc_bwd_512 = _mm512_fmadd_ps(x_v, c_v, acc_bwd_512);
+                }
+                sum_bwd = Horizontal_Sum_Avx512(acc_bwd_512);
+#endif
+#if defined(HAS_AVX) || defined(_MSC_VER)
+                __m256 acc_bwd_256 = _mm256_setzero_ps();
+                for (; n + 8 <= dstate; n += 8) {
+                    __m256 x_v = _mm256_loadu_ps(&deltaB_u_ptr[x_base_bwd + n]);
+                    __m256 c_v = _mm256_loadu_ps(&C_bwd_ptr[c_base + n]);
+                    #if defined(__FMA__)
+                    acc_bwd_256 = _mm256_fmadd_ps(x_v, c_v, acc_bwd_256);
+                    #else
+                    acc_bwd_256 = _mm256_add_ps(acc_bwd_256, _mm256_mul_ps(x_v, c_v));
+                    #endif
+                }
+                sum_bwd += Horizontal_Sum_Avx(acc_bwd_256);
+#endif
+#if defined(HAS_SSE)
+                __m128 acc_bwd_128 = _mm_setzero_ps();
+                for (; n + 4 <= dstate; n += 4) {
+                    __m128 x_v = _mm_loadu_ps(&deltaB_u_ptr[x_base_bwd + n]);
+                    __m128 c_v = _mm_loadu_ps(&C_bwd_ptr[c_base + n]);
+                    acc_bwd_128 = _mm_add_ps(acc_bwd_128, _mm_mul_ps(x_v, c_v));
+                }
+                sum_bwd += Horizontal_Sum_Sse(acc_bwd_128);
+#endif
+#if defined(HAS_NEON)
+                float32x4_t acc_bwd_neon = vdupq_n_f32(0.0f);
+                for (; n + 4 <= dstate; n += 4) {
+                    float32x4_t x_v = vld1q_f32(&deltaB_u_ptr[x_base_bwd + n]);
+                    float32x4_t c_v = vld1q_f32(&C_bwd_ptr[c_base + n]);
+                    acc_bwd_neon = vmlaq_f32(acc_bwd_neon, x_v, c_v);
+                }
+                sum_bwd += Horizontal_Sum_Neon(acc_bwd_neon);
+#endif
+                for (; n < dstate; n++) {
+                    sum_bwd += deltaB_u_ptr[x_base_bwd + n] * C_bwd_ptr[c_base + n];
+                }
+                
+                y_fwd_ptr[y_idx] = sum_fwd;
+                y_bwd_ptr[y_idx] = sum_bwd;
+            }
+        }
+    }
     
     // 添加D项
     y_fwd = y_fwd + x_fwd_conv * D_fwd.unsqueeze(0).unsqueeze(-1);
