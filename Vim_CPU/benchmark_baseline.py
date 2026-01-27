@@ -12,7 +12,11 @@ ResNet-50和ViT-Small基准测试脚本
 使用方式：
     python benchmark_baseline.py
 """
-
+import os
+NUM_THREADS = 16 # 根据测试结果调整
+os.environ['OMP_NUM_THREADS'] = str(NUM_THREADS)
+os.environ['MKL_NUM_THREADS'] = str(NUM_THREADS)
+os.environ['OPENBLAS_NUM_THREADS'] = str(NUM_THREADS)
 import torch
 import time
 import platform
@@ -20,7 +24,7 @@ import sys
 from datetime import datetime
 
 # 强制使用CPU，禁用CUDA
-import os
+
 os.environ['CUDA_VISIBLE_DEVICES'] = ''
 torch.set_default_device('cpu')
 
