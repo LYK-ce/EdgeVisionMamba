@@ -12,14 +12,22 @@ Vision Mamba CPU推理性能测试脚本
 使用方式：
     python inf_cpu.py
 """
-
 import os
+NUM_THREADS = 4 # 根据测试结果调整
+os.environ['OMP_NUM_THREADS'] = str(NUM_THREADS)
+os.environ['MKL_NUM_THREADS'] = str(NUM_THREADS)
+os.environ['OPENBLAS_NUM_THREADS'] = str(NUM_THREADS)
+
+
 import sys
 import torch
 import time
 import logging
 import platform
 from datetime import datetime
+
+
+# torch.set_num_threads(8)
 
 os.environ['SELECTIVE_SCAN_FORCE_FALLBACK'] = 'TRUE'
 os.environ['CAUSAL_CONV1D_FORCE_FALLBACK'] = 'TRUE'
@@ -202,7 +210,7 @@ def main():
     # 按参数量分类(5种) + 按FLOPs分类(4种) = 9种模型
     models_to_test = [
         # 按参数量
-        'vim_5m', 'vim_tiny', 'vim_10m', 'vim_15m', 'vim_20m',
+        'vim_10m','vim_15m','vim_20m',
         # 按FLOPs
         # 'vim_2gflops', 'vim_3gflops', 'vim_4gflops', 'vim_5gflops',
     ]
